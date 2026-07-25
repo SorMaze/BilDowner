@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use regex::Regex;
 use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, COOKIE, ORIGIN, REFERER};
 use serde::Deserialize;
+use tokio::sync::OnceCell;
 use url::Url;
 
 use crate::cli::CodecChoice;
@@ -19,15 +20,14 @@ const NAV_API: &str = "https://api.bilibili.com/x/web-interface/nav";
 const PLAY_API: &str = "https://api.bilibili.com/x/player/wbi/playurl";
 const SEASON_API: &str = "https://api.bilibili.com/pgc/view/web/season";
 const PGC_PLAY_API: &str = "https://api.bilibili.com/pgc/player/web/playurl";
-const MIXIN_KEY_ENC_TAB: [usize; 64] = [
-    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29,
-    28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25,
-    54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
-];
+const VIDEO_PAGE: &str = "https://www.bilibili.com/video/";
+const MAX_FRONTEND_SCRIPTS: usize = 16;
+const MAX_FRONTEND_SCRIPT_SIZE: usize = 8 * 1024 * 1024;
 
 pub struct BiliClient {
     client: reqwest::Client,
     cookie: Option<String>,
+    mixin_key_enc_tab: OnceCell<[usize; 64]>,
 }
 
 impl BiliClient {
@@ -36,7 +36,11 @@ impl BiliClient {
             .user_agent(USER_AGENT)
             .build()
             .context("无法创建 HTTP 客户端")?;
-        Ok(Self { client, cookie })
+        Ok(Self {
+            client,
+            cookie,
+            mixin_key_enc_tab: OnceCell::new(),
+        })
     }
 
     fn get(&self, url: &str) -> reqwest::RequestBuilder {
@@ -61,6 +65,23 @@ impl BiliClient {
             .header(REFERER, referer)
             .header(ORIGIN, "https://www.bilibili.com")
             .header(ACCEPT, "*/*");
+        if let Some(cookie) = &self.cookie {
+            request.header(COOKIE, cookie)
+        } else {
+            request
+        }
+    }
+
+    fn frontend_get(&self, url: &str) -> reqwest::RequestBuilder {
+        let request = self
+            .client
+            .get(url)
+            .header(
+                ACCEPT,
+                "text/html,application/xhtml+xml,application/javascript,text/javascript;q=0.9,*/*;q=0.8",
+            )
+            .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9")
+            .header(REFERER, "https://www.bilibili.com/");
         if let Some(cookie) = &self.cookie {
             request.header(COOKIE, cookie)
         } else {
@@ -163,7 +184,8 @@ impl BiliClient {
 
     pub async fn play_info(&self, bvid: &str, cid: u64, qn: u32) -> Result<PlayData> {
         let nav = self.nav().await?;
-        let mixin_key = make_mixin_key(&nav.wbi_img)?;
+        let mixin_key_enc_tab = self.mixin_key_enc_tab(bvid).await?;
+        let mixin_key = make_mixin_key(&nav.wbi_img, mixin_key_enc_tab)?;
         let mut params = BTreeMap::from([
             ("bvid".to_owned(), bvid.to_owned()),
             ("cid".to_owned(), cid.to_string()),
@@ -186,6 +208,77 @@ impl BiliClient {
             .await
             .context("解析播放地址失败")?
             .into_data("获取播放地址")
+    }
+
+    async fn mixin_key_enc_tab(&self, bvid: &str) -> Result<&[usize; 64]> {
+        self.mixin_key_enc_tab
+            .get_or_try_init(|| async { self.fetch_mixin_key_enc_tab(bvid).await })
+            .await
+    }
+
+    async fn fetch_mixin_key_enc_tab(&self, bvid: &str) -> Result<[usize; 64]> {
+        let page_url =
+            Url::parse(&format!("{VIDEO_PAGE}{bvid}")).context("无法构造 Bilibili 视频页 URL")?;
+        let html = self
+            .frontend_get(page_url.as_str())
+            .send()
+            .await
+            .context("请求 Bilibili 视频页失败（无法获取 WBI 混淆表）")?
+            .error_for_status()
+            .context("Bilibili 视频页返回 HTTP 错误（无法获取 WBI 混淆表）")?
+            .text()
+            .await
+            .context("读取 Bilibili 视频页失败（无法获取 WBI 混淆表）")?;
+        let script_urls = frontend_script_urls(&page_url, &html);
+        if script_urls.is_empty() {
+            bail!("Bilibili 视频页中没有可识别的官方前端脚本，无法获取 WBI 混淆表");
+        }
+
+        let mut failures = Vec::new();
+        for script_url in script_urls.into_iter().take(MAX_FRONTEND_SCRIPTS) {
+            let response = match self
+                .frontend_get(script_url.as_str())
+                .header(REFERER, page_url.as_str())
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    failures.push(format!("{}: {error}", script_url.path()));
+                    continue;
+                }
+            };
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAX_FRONTEND_SCRIPT_SIZE as u64)
+            {
+                failures.push(format!("{}: 文件过大", script_url.path()));
+                continue;
+            }
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    failures.push(format!("{}: {error}", script_url.path()));
+                    continue;
+                }
+            };
+            if bytes.len() > MAX_FRONTEND_SCRIPT_SIZE {
+                failures.push(format!("{}: 文件过大", script_url.path()));
+                continue;
+            }
+            let script = String::from_utf8_lossy(&bytes);
+            if let Some(table) = extract_mixin_key_enc_tab(&script) {
+                return Ok(table);
+            }
+        }
+
+        let detail = if failures.is_empty() {
+            String::new()
+        } else {
+            format!("；部分脚本读取失败：{}", failures.join("；"))
+        };
+        bail!("未能从 Bilibili 当前前端脚本中识别 WBI 混淆表，前端算法可能已改变{detail}")
     }
 
     pub async fn play_info_for_page(
@@ -730,7 +823,104 @@ fn parse_video_id(input: &str) -> Result<VideoId> {
     }
 }
 
-fn make_mixin_key(images: &WbiImages) -> Result<String> {
+fn frontend_script_urls(page_url: &Url, html: &str) -> Vec<Url> {
+    let initial_state_regex =
+        Regex::new(r#""insertScripts"\s*:\s*(\[[^\]]*\])"#).expect("static regex");
+    let script_tag_regex = Regex::new(r#"(?is)<script\b[^>]*\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)')"#)
+        .expect("static regex");
+    let mut raw_urls = Vec::new();
+    for captures in initial_state_regex.captures_iter(html) {
+        if let Ok(urls) = serde_json::from_str::<Vec<String>>(&captures[1]) {
+            raw_urls.extend(urls);
+        }
+    }
+    raw_urls.extend(script_tag_regex.captures_iter(html).filter_map(|captures| {
+        captures
+            .get(1)
+            .or_else(|| captures.get(2))
+            .map(|value| value.as_str().to_owned())
+    }));
+
+    let mut seen = HashSet::new();
+    raw_urls
+        .into_iter()
+        .filter_map(|raw_url| page_url.join(&raw_url).ok())
+        .filter(is_trusted_frontend_script_url)
+        .filter(|url| seen.insert(url.as_str().to_owned()))
+        .collect()
+}
+
+fn is_trusted_frontend_script_url(url: &Url) -> bool {
+    if url.scheme() != "https" {
+        return false;
+    }
+    url.host_str().is_some_and(|host| {
+        host == "bilibili.com"
+            || host.ends_with(".bilibili.com")
+            || host == "hdslb.com"
+            || host.ends_with(".hdslb.com")
+    })
+}
+
+fn extract_mixin_key_enc_tab(script: &str) -> Option<[usize; 64]> {
+    let array_regex =
+        Regex::new(r"\[((?:\s*\d{1,3}\s*,){63}\s*\d{1,3}\s*)\]").expect("static regex");
+    let mut best: Option<(u32, [usize; 64])> = None;
+    let mut best_is_ambiguous = false;
+
+    for captures in array_regex.captures_iter(script) {
+        let values = captures[1]
+            .split(',')
+            .map(str::trim)
+            .map(str::parse::<usize>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()?;
+        let table: [usize; 64] = values.try_into().ok()?;
+        let mut seen = [false; 64];
+        if table
+            .iter()
+            .any(|&value| value >= seen.len() || std::mem::replace(&mut seen[value], true))
+        {
+            continue;
+        }
+
+        let whole_match = captures.get(0).expect("whole regex match");
+        let start = whole_match.start().saturating_sub(1024);
+        let end = (whole_match.end() + 1024).min(script.len());
+        let context = String::from_utf8_lossy(&script.as_bytes()[start..end]);
+        let score = [
+            ("w_rid", 8),
+            ("slice(0,32)", 4),
+            ("charAt", 3),
+            ("wts", 3),
+            ("imgKey", 2),
+            ("subKey", 2),
+            ("mixin", 2),
+        ]
+        .into_iter()
+        .filter_map(|(needle, points)| context.contains(needle).then_some(points))
+        .sum();
+
+        match &best {
+            None => {
+                best = Some((score, table));
+                best_is_ambiguous = false;
+            }
+            Some((best_score, _)) if score > *best_score => {
+                best = Some((score, table));
+                best_is_ambiguous = false;
+            }
+            Some((best_score, best_table)) if score == *best_score && table != *best_table => {
+                best_is_ambiguous = true;
+            }
+            _ => {}
+        }
+    }
+
+    best.filter(|_| !best_is_ambiguous).map(|(_, table)| table)
+}
+
+fn make_mixin_key(images: &WbiImages, mixin_key_enc_tab: &[usize; 64]) -> Result<String> {
     fn file_stem(url: &str) -> Result<String> {
         let url = Url::parse(url).context("WBI 图片 URL 不合法")?;
         let file = url
@@ -749,7 +939,7 @@ fn make_mixin_key(images: &WbiImages) -> Result<String> {
     if chars.len() < 64 {
         bail!("WBI 密钥长度异常");
     }
-    Ok(MIXIN_KEY_ENC_TAB
+    Ok(mixin_key_enc_tab
         .iter()
         .filter_map(|index| chars.get(*index))
         .take(32)
@@ -844,9 +1034,10 @@ pub fn codec_name(codecid: u32, codecs: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PageSelectionSource, VideoInfo, VideoPage, parse_page_selection, parse_quality,
-        parse_video_id,
+        PageSelectionSource, VideoInfo, VideoPage, WbiImages, extract_mixin_key_enc_tab,
+        frontend_script_urls, make_mixin_key, parse_page_selection, parse_quality, parse_video_id,
     };
+    use url::Url;
 
     fn video_info(page_count: usize) -> VideoInfo {
         VideoInfo {
@@ -941,5 +1132,59 @@ mod tests {
         assert_eq!(parse_quality("1080p+", &[120, 112, 80]).unwrap(), 112);
         assert_eq!(parse_quality("best", &[120, 112, 80]).unwrap(), 120);
         assert!(parse_quality("8k", &[80, 64]).is_err());
+    }
+
+    #[test]
+    fn extracts_frontend_script_urls_in_priority_order() {
+        let page_url = Url::parse("https://www.bilibili.com/video/BV1test").unwrap();
+        let html = r#"
+            <script>
+                window.__INITIAL_STATE__ = {
+                    "insertScripts": ["\u002F\u002Fs1.hdslb.com\u002Fbfs\u002Fvideo.js"]
+                };
+            </script>
+            <script src='//s1.hdslb.com/bfs/fallback.js'></script>
+            <script src='https://example.com/untrusted.js'></script>
+        "#;
+        let urls = frontend_script_urls(&page_url, html);
+        assert_eq!(
+            urls.iter().map(Url::as_str).collect::<Vec<_>>(),
+            vec![
+                "https://s1.hdslb.com/bfs/video.js",
+                "https://s1.hdslb.com/bfs/fallback.js"
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_semantic_wbi_permutation_from_frontend_script() {
+        let invalid = std::iter::repeat_n("0", 64).collect::<Vec<_>>().join(",");
+        let permutation = (0..64)
+            .rev()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let script = format!(
+            "const decoy=[{invalid}];function wbi(imgKey,subKey){{\
+             const table=[{permutation}];table.forEach(i=>source.charAt(i));\
+             return result.slice(0,32)+wts+w_rid;}}"
+        );
+        assert_eq!(
+            extract_mixin_key_enc_tab(&script).unwrap(),
+            std::array::from_fn(|index| 63 - index)
+        );
+    }
+
+    #[test]
+    fn builds_mixin_key_with_runtime_permutation() {
+        let images = WbiImages {
+            img_url: "https://i0.hdslb.com/bfs/wbi/0123456789abcdef0123456789abcdef.png".to_owned(),
+            sub_url: "https://i0.hdslb.com/bfs/wbi/fedcba9876543210fedcba9876543210.png".to_owned(),
+        };
+        let identity = std::array::from_fn(|index| index);
+        assert_eq!(
+            make_mixin_key(&images, &identity).unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
     }
 }
