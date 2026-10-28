@@ -578,11 +578,11 @@ pub struct PlayData {
     message: Option<String>,
     #[serde(default)]
     is_drm: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub accept_quality: Vec<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub accept_description: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub support_formats: Vec<SupportFormat>,
     pub dash: Option<Dash>,
 }
@@ -628,7 +628,7 @@ impl PlayData {
         &self,
         requested_quality: &str,
         codec: CodecChoice,
-    ) -> Result<(&DashStream, &DashStream, String)> {
+    ) -> Result<(&DashStream, Option<&DashStream>, String)> {
         let dash = self
             .dash
             .as_ref()
@@ -678,11 +678,7 @@ impl PlayData {
                 })
                 .unwrap_or(candidates[0])
         };
-        let audio = dash
-            .audio
-            .iter()
-            .max_by_key(|stream| stream.bandwidth)
-            .context("DASH 响应中没有标准音频流")?;
+        let audio = dash.audio.iter().max_by_key(|stream| stream.bandwidth);
         Ok((video, audio, self.quality_description(quality)))
     }
 }
@@ -696,17 +692,26 @@ pub struct SupportFormat {
 
 #[derive(Debug, Deserialize)]
 pub struct Dash {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub video: Vec<DashStream>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub audio: Vec<DashStream>,
+}
+
+// Bilibili uses both null and missing fields for absent lists (e.g. silent videos).
+fn null_as_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
 pub struct DashStream {
     pub id: u32,
     pub base_url: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub backup_url: Vec<String>,
     #[serde(default)]
     pub bandwidth: u64,
@@ -1034,10 +1039,73 @@ pub fn codec_name(codecid: u32, codecs: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PageSelectionSource, VideoInfo, VideoPage, WbiImages, extract_mixin_key_enc_tab,
+        PageSelectionSource, PlayData, VideoInfo, VideoPage, WbiImages, extract_mixin_key_enc_tab,
         frontend_script_urls, make_mixin_key, parse_page_selection, parse_quality, parse_video_id,
     };
+    use crate::cli::CodecChoice;
+    use serde_json::json;
     use url::Url;
+
+    #[test]
+    fn selects_video_when_audio_is_null_missing_or_empty() {
+        // BV19s4y1G7td returns dash.audio = null for all five silent pages.
+        for audio in [None, Some(json!(null)), Some(json!([]))] {
+            let mut response = json!({
+                "dash": {
+                    "video": [{"id": 32, "codecid": 7, "base_url": "https://example.com/video",
+                               "backup_url": null}]
+                }
+            });
+            if let Some(audio) = audio {
+                response["dash"]["audio"] = audio;
+            }
+            let play: PlayData = serde_json::from_value(response).unwrap();
+            let (video, audio, _) = play.select_streams("best", CodecChoice::Auto).unwrap();
+            assert_eq!(video.id, 32);
+            assert!(audio.is_none());
+            assert_eq!(
+                video.urls().collect::<Vec<_>>(),
+                ["https://example.com/video"]
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_highest_bitrate_audio_and_backup_urls() {
+        let play: PlayData = serde_json::from_value(json!({
+            "dash": {
+                "video": [{"id": 32, "codecid": 7, "base_url": "https://example.com/video",
+                           "backup_url": ["https://example.com/backup"]}],
+                "audio": [
+                    {"id": 1, "base_url": "https://example.com/low", "bandwidth": 64000},
+                    {"id": 2, "base_url": "https://example.com/high", "bandwidth": 128000}
+                ]
+            }
+        }))
+        .unwrap();
+        let (video, audio, _) = play.select_streams("best", CodecChoice::Auto).unwrap();
+        assert_eq!(audio.unwrap().id, 2);
+        assert_eq!(video.urls().count(), 2);
+    }
+
+    #[test]
+    fn handles_null_metadata_but_rejects_invalid_list_types() {
+        let play: PlayData = serde_json::from_value(json!({
+            "accept_quality": null, "accept_description": null, "support_formats": null,
+            "dash": {"video": null, "audio": null}
+        }))
+        .unwrap();
+        assert!(play.available_qualities().is_empty());
+        assert!(play.select_streams("best", CodecChoice::Auto).is_err());
+        for audio in [json!(false), json!("invalid"), json!({})] {
+            assert!(
+                serde_json::from_value::<PlayData>(json!({
+                    "dash": {"audio": audio}
+                }))
+                .is_err()
+            );
+        }
+    }
 
     fn video_info(page_count: usize) -> VideoInfo {
         VideoInfo {

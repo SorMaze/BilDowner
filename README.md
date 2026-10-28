@@ -1,10 +1,10 @@
 # BilDowner
 
-[![Release](https://github.com/Booklight12/BilDowner/actions/workflows/release.yml/badge.svg)](https://github.com/Booklight12/BilDowner/actions/workflows/release.yml)
+[![Release](https://github.com/SorMaze/BilDowner/actions/workflows/release.yml/badge.svg)](https://github.com/SorMaze/BilDowner/actions/workflows/release.yml)
 [![License: BSD-2-Clause](https://img.shields.io/badge/License-BSD--2--Clause-blue.svg)](LICENSE)
 
 BilDowner 是一个纯 Rust 命令行 Bilibili / 抖音 / X 视频下载器，不包含前端页面。Bilibili 通过 `x/player/wbi/playurl` 获取 DASH 流，分别下载视频和音频，默认由内置 MP4 封装器逐样本合并 AVC/H.264 与 AAC 轨道；也可以显式选择 FFmpeg。两种方式都不进行有损重新编码。抖音通过分享页公开的 SSR 作品数据解析 MP4 播放流，优先下载无水印地址，并在不可用时自动回退到原始播放地址。X 下载器从官方 syndication JSON 解析 `video.twimg.com` MP4 变体，默认下载最高码率版本。
-当前版本：**1.1.0 Alpha**。
+当前版本：**1.1.1 Alpha**。
 
 请只下载你有权保存的内容。本工具不会绕过 DRM、付费或账号权限；接口返回的清晰度取决于当前账号本身具有的播放权限。
 
@@ -17,6 +17,7 @@ BilDowner 是一个纯 Rust 命令行 Bilibili / 抖音 / X 视频下载器，�
 - 可选择 AVC/H.264、HEVC/H.265 或 AV1；默认优先兼容性较好的 AVC
 - `merged`、`separate`、`both` 三种输出模式
 - 视频与音频并行下载，支持 `.part` 文件续传和 DASH 备用 CDN
+- 支持无音轨视频；接口返回 `audio: null` 时保存纯视频，不添加静音音轨
 - 内置纯 Rust MP4 合并器，默认 AVC/H.264 + AAC 下载无需安装 FFmpeg；可通过 `--ffmpeg` 显式切换
 - 支持抖音短分享链接和 `douyin.com/video/<作品 ID>` 链接，无需登录或额外插件
 - 支持 `x.com` / `twitter.com` 帖子视频，默认最高码率，也可用 `--quality` 限制分辨率
@@ -76,6 +77,8 @@ cargo run -- download "https://x.com/Kimi_Moonshot/status/2077521842080817296" -
 - `merged`：输出带音频的 `.mp4`，成功后删除临时视频/音频流
 - `separate`：输出 `.video.m4s` 与 `.audio.m4s`
 - `both`：同时保留上述三种文件，也是默认值
+
+如果该分 P 没有标准音频流，则只下载 `.video.m4s`；`merged` 和 `both` 仍会生成可播放的纯视频 `.mp4`。内置封装器和 FFmpeg 均支持这种情况。
 
 默认使用内置合并器。需要 FFmpeg 时可显式启用，或指定自定义路径：
 

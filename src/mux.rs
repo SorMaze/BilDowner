@@ -10,11 +10,10 @@ use mp4::{
     TrackConfig, TrackType,
 };
 
-pub fn mux_avc_aac(video_path: &Path, audio_path: &Path, output_path: &Path) -> Result<()> {
+pub fn mux_avc_aac(video_path: &Path, audio_path: Option<&Path>, output_path: &Path) -> Result<()> {
     let video = open_mp4(video_path, "视频")?;
-    let audio = open_mp4(audio_path, "音频")?;
+    let audio = audio_path.map(|path| open_mp4(path, "音频")).transpose()?;
     let (video_track_id, video_config) = video_track_config(&video)?;
-    let (audio_track_id, audio_config) = audio_track_config(&audio)?;
 
     let output = File::create(output_path)
         .with_context(|| format!("无法创建临时合并文件 {}", output_path.display()))?;
@@ -32,12 +31,14 @@ pub fn mux_avc_aac(video_path: &Path, audio_path: &Path, output_path: &Path) -> 
     writer
         .add_track(&video_config)
         .context("创建视频轨道失败")?;
-    writer
-        .add_track(&audio_config)
-        .context("创建音频轨道失败")?;
-
     copy_fragmented_samples(&video, video_path, video_track_id, &mut writer, 1, "视频")?;
-    copy_fragmented_samples(&audio, audio_path, audio_track_id, &mut writer, 2, "音频")?;
+    if let Some((audio, audio_path)) = audio.as_ref().zip(audio_path) {
+        let (audio_track_id, audio_config) = audio_track_config(audio)?;
+        writer
+            .add_track(&audio_config)
+            .context("创建音频轨道失败")?;
+        copy_fragmented_samples(audio, audio_path, audio_track_id, &mut writer, 2, "音频")?;
+    }
     writer.write_end().context("写入 MP4 索引失败")?;
     writer
         .into_writer()

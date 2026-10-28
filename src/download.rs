@@ -54,7 +54,7 @@ async fn download_page(
         .unwrap_or_else(|| format!("https://www.bilibili.com/video/{bvid}?p={}", page.page));
 
     println!(
-        "准备下载：{} / P{} {}\n清晰度：{}，视频编码：{}，{}x{} {}\n音频码率：约 {} kbps",
+        "准备下载：{} / P{} {}\n清晰度：{}，视频编码：{}，{}x{} {}",
         info.title,
         page.page,
         page.part,
@@ -62,9 +62,13 @@ async fn download_page(
         codec_name(video.codecid, &video.codecs),
         video.width,
         video.height,
-        video.frame_rate,
-        audio.bandwidth / 1000
+        video.frame_rate
     );
+    if let Some(audio) = audio {
+        println!("音频码率：约 {} kbps", audio.bandwidth / 1000);
+    } else {
+        println!("该分 P 没有标准音频流，将保存纯视频。");
+    }
 
     let progress = MultiProgress::new();
     let video_download = download_stream(
@@ -76,34 +80,42 @@ async fn download_page(
         &progress,
         args.force,
     );
-    let audio_download = download_stream(
-        client,
-        audio,
-        &referer,
-        &audio_path,
-        "音频",
-        &progress,
-        args.force,
-    );
+    let audio_download = async {
+        if let Some(audio) = audio {
+            download_stream(
+                client,
+                audio,
+                &referer,
+                &audio_path,
+                "音频",
+                &progress,
+                args.force,
+            )
+            .await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
     tokio::try_join!(video_download, audio_download)?;
 
+    let audio_path = audio.map(|_| audio_path.as_path());
     if args.mode.needs_merge() {
         if let Some(ffmpeg) = args.ffmpeg.as_deref() {
-            merge_with_ffmpeg(ffmpeg, &video_path, &audio_path, &merged_path, args.force).await?;
+            merge_with_ffmpeg(ffmpeg, &video_path, audio_path, &merged_path, args.force).await?;
         } else {
-            merge_with_rust(&video_path, &audio_path, &merged_path, args.force).await?;
+            merge_with_rust(&video_path, audio_path, &merged_path, args.force).await?;
         }
         println!("合并文件：{}", merged_path.display());
     }
     if args.mode.keeps_separate() {
-        println!(
-            "分离视频：{}\n分离音频：{}",
-            video_path.display(),
-            audio_path.display()
-        );
+        println!("分离视频：{}", video_path.display());
+        if let Some(audio_path) = audio_path {
+            println!("分离音频：{}", audio_path.display());
+        }
     } else if args.mode == DownloadMode::Merged {
         fs::remove_file(&video_path).await.ok();
-        fs::remove_file(&audio_path).await.ok();
+        if let Some(audio_path) = audio_path {
+            fs::remove_file(audio_path).await.ok();
+        }
     }
     Ok(())
 }
@@ -144,7 +156,12 @@ async fn download_stream(
     .await
 }
 
-async fn merge_with_rust(video: &Path, audio: &Path, output: &Path, force: bool) -> Result<()> {
+async fn merge_with_rust(
+    video: &Path,
+    audio: Option<&Path>,
+    output: &Path,
+    force: bool,
+) -> Result<()> {
     if output.exists() && !force {
         println!("合并文件已存在，跳过：{}", output.display());
         return Ok(());
@@ -157,12 +174,13 @@ async fn merge_with_rust(video: &Path, audio: &Path, output: &Path, force: bool)
     }
     println!("正在用内置 MP4 封装器无重新编码合并……");
     let video = video.to_owned();
-    let audio = audio.to_owned();
+    let audio = audio.map(Path::to_owned);
     let temporary_for_task = temporary.clone();
-    let result =
-        tokio::task::spawn_blocking(move || mux::mux_avc_aac(&video, &audio, &temporary_for_task))
-            .await
-            .context("内置 MP4 合并任务异常终止")?;
+    let result = tokio::task::spawn_blocking(move || {
+        mux::mux_avc_aac(&video, audio.as_deref(), &temporary_for_task)
+    })
+    .await
+    .context("内置 MP4 合并任务异常终止")?;
     if let Err(error) = result {
         fs::remove_file(&temporary).await.ok();
         return Err(error);
@@ -181,7 +199,7 @@ async fn merge_with_rust(video: &Path, audio: &Path, output: &Path, force: bool)
 async fn merge_with_ffmpeg(
     ffmpeg: &Path,
     video: &Path,
-    audio: &Path,
+    audio: Option<&Path>,
     output: &Path,
     force: bool,
 ) -> Result<()> {
@@ -196,19 +214,22 @@ async fn merge_with_ffmpeg(
             .with_context(|| format!("无法清理 FFmpeg 临时文件 {}", temporary.display()))?;
     }
     println!("正在用 FFmpeg 无重新编码合并……");
-    let status = Command::new(ffmpeg)
+    let mut command = Command::new(ffmpeg);
+    command
         .arg("-y")
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("warning")
         .arg("-i")
-        .arg(video)
-        .arg("-i")
-        .arg(audio)
-        .arg("-map")
-        .arg("0:v:0")
-        .arg("-map")
-        .arg("1:a:0")
+        .arg(video);
+    if let Some(audio) = audio {
+        command.arg("-i").arg(audio);
+    }
+    command.arg("-map").arg("0:v:0");
+    if audio.is_some() {
+        command.arg("-map").arg("1:a:0");
+    }
+    let status = command
         .arg("-c")
         .arg("copy")
         .arg(&temporary)

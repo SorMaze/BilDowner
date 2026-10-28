@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::{StatusCode, header::RANGE};
 use tokio::{
     fs::{self, OpenOptions},
@@ -134,9 +134,9 @@ async fn try_download_url(
 }
 
 fn make_progress_bar(label: &str, total: Option<u64>) -> ProgressBar {
-    let bar = total
-        .map(ProgressBar::new)
-        .unwrap_or_else(ProgressBar::new_spinner);
+    // Configure without drawing: MultiProgress must own the first terminal render,
+    // otherwise set_prefix leaves an orphaned 0-byte line when the target changes.
+    let bar = ProgressBar::with_draw_target(total, ProgressDrawTarget::hidden());
     let style = if total.is_some() {
         ProgressStyle::with_template(
             "{prefix:.bold} [{bar:32.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} ETA {eta}",
