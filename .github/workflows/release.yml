@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag, for example v1.1.1"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,17 +18,21 @@ jobs:
   windows-release:
     name: Build Windows release
     runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Verify tag and package version
         shell: pwsh
         run: |
           $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
           $packageVersion = $metadata.packages[0].version
-          $tagVersion = "${{ github.ref_name }}" -replace '^v', ''
+          $tagVersion = $env:RELEASE_TAG -replace '^v', ''
           if ($packageVersion -ne $tagVersion) {
             throw "Tag version '$tagVersion' does not match Cargo version '$packageVersion'."
           }
@@ -44,9 +54,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = $env:RELEASE_TAG
           $releaseTitleVersion = $tag -replace '^v', ''
-          $releaseChannelArgs = if ($releaseTitleVersion -match '-') {
+          [string[]]$releaseChannelArgs = if ($releaseTitleVersion -match '-') {
             @('--prerelease')
           } else {
             @('--latest')
