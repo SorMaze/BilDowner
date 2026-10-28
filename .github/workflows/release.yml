@@ -39,13 +39,18 @@ jobs:
       - name: Build optimized executable
         run: cargo build --release --locked
 
-      - name: Package and publish prerelease
+      - name: Package and publish release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ github.ref_name }}"
-          $releaseTitleVersion = ($tag -replace '^v', '') -replace '-alpha$', ' Alpha'
+          $releaseTitleVersion = $tag -replace '^v', ''
+          $releaseChannelArgs = if ($releaseTitleVersion -match '-') {
+            @('--prerelease')
+          } else {
+            @('--latest')
+          }
           $assetBase = "BilDowner-$tag-windows-x86_64"
           $dist = Join-Path $PWD "dist"
           New-Item -ItemType Directory -Path $dist -Force | Out-Null
@@ -66,5 +71,5 @@ jobs:
           gh release create $tag $exe $zip $checksums `
             --verify-tag `
             --title "BilDowner $releaseTitleVersion" `
-            --prerelease `
-            --generate-notes
+            --generate-notes `
+            @releaseChannelArgs
