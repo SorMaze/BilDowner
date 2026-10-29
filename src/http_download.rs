@@ -133,7 +133,7 @@ async fn try_download_url(
     Ok(())
 }
 
-fn make_progress_bar(label: &str, total: Option<u64>) -> ProgressBar {
+pub(crate) fn make_progress_bar(label: &str, total: Option<u64>) -> ProgressBar {
     // Configure without drawing: MultiProgress must own the first terminal render,
     // otherwise set_prefix leaves an orphaned 0-byte line when the target changes.
     let bar = ProgressBar::with_draw_target(total, ProgressDrawTarget::hidden());

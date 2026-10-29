@@ -13,6 +13,14 @@ use crate::{
 pub async fn run(client: &BiliClient, args: DownloadArgs) -> Result<()> {
     let info = client.video_info(&args.input).await?;
     let selection = info.resolve_pages(&args.input, args.page.as_deref())?;
+    if let Some(time) = args.time {
+        for number in &selection.pages {
+            let page = info.page(*number)?;
+            if page.duration > 0 && time.start() >= page.duration as f64 {
+                bail!("P{} 的时间起点超出时长（{} 秒）", page.page, page.duration);
+            }
+        }
+    }
     print_page_selection_notice(&info, args.page.as_deref(), &selection, "下载");
 
     fs::create_dir_all(&args.output_dir)
@@ -68,6 +76,10 @@ async fn download_page(
         println!("音频码率：约 {} kbps", audio.bandwidth / 1000);
     } else {
         println!("该分 P 没有标准音频流，将保存纯视频。");
+    }
+
+    if args.time.is_some() {
+        return crate::clip::run(client, video, audio, &referer, &base, args).await;
     }
 
     let progress = MultiProgress::new();

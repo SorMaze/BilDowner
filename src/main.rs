@@ -1,10 +1,12 @@
 mod api;
 mod auth;
 mod cli;
+mod clip;
 mod douyin;
 mod download;
 mod http_download;
 mod mux;
+mod time_range;
 #[cfg(windows)]
 mod wininet;
 mod x;
@@ -49,6 +51,11 @@ async fn run() -> Result<()> {
             }
         }
         Command::Download(args) => {
+            if args.time.is_some()
+                && (douyin::is_douyin_input(&args.input) || x::is_x_input(&args.input))
+            {
+                anyhow::bail!("-t/--time 当前支持 Bilibili 视频和番剧/影视的 DASH 流");
+            }
             if douyin::is_douyin_input(&args.input) {
                 douyin::download(args).await
             } else if x::is_x_input(&args.input) {

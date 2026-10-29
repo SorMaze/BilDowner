@@ -725,6 +725,17 @@ pub struct DashStream {
     pub height: u32,
     #[serde(default)]
     pub frame_rate: String,
+    pub segment_base: Option<SegmentBase>,
+    #[serde(rename = "SegmentBase")]
+    pub legacy_segment_base: Option<SegmentBase>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SegmentBase {
+    #[serde(alias = "Initialization")]
+    pub initialization: String,
+    #[serde(alias = "indexRange")]
+    pub index_range: String,
 }
 
 impl DashStream {
